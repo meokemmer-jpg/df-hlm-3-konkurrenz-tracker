@@ -13,9 +13,36 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
+import sys
 
-import requests
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import yaml
+
+from _df_common.pii_scrubber import PIIScrubber, scrub_audit_payload
+from _df_common.welle_b2_patches import (
+    K13PreActionVerifier,
+    K16MutexGuard,
+    MOCK_PREFIX,
+    make_mock_url,
+    make_provenance_envelope,
+)
+
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    class _RequestsFallback:
+        class RequestException(Exception):
+            pass
+
+        class HTTPError(RequestException):
+            pass
+
+        class Session:
+            def get(self, _url: str, timeout: float = 30.0) -> Any:
+                raise _RequestsFallback.RequestException("requests is not installed")
+
+    requests = _RequestsFallback()  # type: ignore[assignment]
 
 try:
     import structlog
@@ -192,12 +219,14 @@ class KonkurrenzTracker:
         self.sleep_fn = sleep_fn
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.skip_mutex_for_tests = skip_mutex_for_tests
+        self.pii_scrubber = PIIScrubber(enabled=True, kemmer_names_enabled=True)
         ops = self.config["operations"]
         lc3 = self.config["lose_coupling"]["LC3_circuit_breaker"]
         self.allowed_domains = set(ops["allowed_domains"])
         self.timeout_s = float(lc3["timeout_s"])
         self.rate_limit_backoff_s = float(lc3["rate_limit_backoff_s"])
-        self.lock_dir = Path(self.config["k16_concurrent_spawn_mutex"]["lock_dir"])
+        self.lock_dir = Path("/tmp/df-hlm-3.lock")
+        self._mutex_guard: K16MutexGuard | None = None
         self.audit_log_path = self.output_root / ops["audit_log_path"]
         self.dlq_dir = self.output_root / ops["dlq_dir"]
         self.daily_dir = self.output_root / ops["daily_output_dir"]
@@ -228,7 +257,8 @@ class KonkurrenzTracker:
 
     def health_check(self) -> dict[str, Any]:
         payload = {"dependencies": [], "score": 1.0, "healthy": True, "mode": self.current_mode(False, False, False).value}
-        atomic_write_text(self.health_file, json.dumps(payload, indent=2) + "\n")
+        payload_scrubbed = self.pii_scrubber.scrub_dict_recursive(payload)
+        atomic_write_text(self.health_file, self.pii_scrubber.scrub(json.dumps(payload_scrubbed, indent=2) + "\n"))
         return payload
 
     def validate_allowed_domain(self, url: str) -> str:
@@ -240,18 +270,21 @@ class KonkurrenzTracker:
     def acquire_mutex(self) -> bool:
         if self.skip_mutex_for_tests:
             return True
-        try:
-            self.lock_dir.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
+        guard = K16MutexGuard(
+            lock_dir=self.lock_dir,
+            df_engine_marker="konkurrenz_tracker.py",
+            stale_age_hours=float(self.config["k16_concurrent_spawn_mutex"].get("lock_stale_age_h", 6.0)),
+        )
+        result = guard.acquire()
+        if not result.acquired:
             return False
-        atomic_write_text(self.lock_dir / "pid", str(os.getpid()))
+        self._mutex_guard = guard
         return True
 
     def release_mutex(self) -> None:
-        if self.lock_dir.exists():
-            for child in self.lock_dir.iterdir():
-                child.unlink()
-            self.lock_dir.rmdir()
+        if self._mutex_guard is not None:
+            self._mutex_guard.release()
+            self._mutex_guard = None
 
     def current_mode(self, trustpilot_ok: bool, booking_ok: bool, scraped_ok: bool) -> TrackerMode:
         if not self.real_mode_enabled():
@@ -316,6 +349,11 @@ class KonkurrenzTracker:
                 }
         match = re.search(r"rating=(?P<rating>\d+\.\d+);position=(?P<position>\d+);price=(?P<low>\d+)-(?P<high>\d+)", html)
         if not match:
+            match = re.search(
+                r'data-rating="(?P<rating>\d+\.\d+)".*data-position="(?P<position>\d+)".*data-price-range="(?P<low>\d+)-(?P<high>\d+)"',
+                html,
+            )
+        if not match:
             raise ValueError(f"scrape parse failed for {target.hotel_id}")
         return {
             "stars": float(match.group("rating")),
@@ -348,7 +386,21 @@ class KonkurrenzTracker:
         }
 
     def _append_dlq(self, target: HotelTarget, source: str, error: Exception) -> None:
-        atomic_append_jsonl(self.dlq_dir / f"{target.hotel_id}.jsonl", {"hotel_id": target.hotel_id, "source": source, "error": str(error), "ts": self.now_fn().isoformat()})
+        entry = {"hotel_id": target.hotel_id, "source": source, "error": str(error), "ts": self.now_fn().isoformat()}
+        atomic_append_jsonl(self.dlq_dir / f"{target.hotel_id}.jsonl", self.pii_scrubber.scrub_dict_recursive(entry))
+
+    def _pre_action_verify_real_mode(self) -> None:
+        verifier = K13PreActionVerifier(
+            expected_env_tag=os.environ.get("DF_EXPECTED_ENV_TAG", "dev"),
+            expected_mount_pattern="/Users/make",
+            blast_radius_class="state-only",
+        )
+        result = verifier.verify()
+        if not result.ok:
+            raise RuntimeError(f"K13-VETO: {result.failed_check}")
+
+    def _mock_provenance(self, timestamp_iso: str) -> dict[str, Any]:
+        return make_provenance_envelope(df_id="DF-HLM-3", timestamp_iso=timestamp_iso, is_mock=True)
 
     def _build_snapshot(self, target: HotelTarget, snapshot_date: str, mode: TrackerMode, trustpilot: dict[str, Any] | None, booking: dict[str, Any] | None, scraped: dict[str, Any] | None) -> HotelSnapshot:
         fallback = self._mock_metrics(target)
@@ -360,7 +412,17 @@ class KonkurrenzTracker:
                 provenance.append({"source": item["source"], "timestamp": self.now_fn().isoformat(), "confidence_score": item["confidence_score"]})
         if not merged:
             merged = fallback
-            provenance = [{"source": "mock_seed", "timestamp": self.now_fn().isoformat(), "confidence_score": 0.55}]
+            timestamp_iso = self.now_fn().isoformat()
+            provenance = [
+                {
+                    "source": "mock_seed",
+                    "mock_id": f"{MOCK_PREFIX}{target.hotel_id}",
+                    "source_url": make_mock_url("mock://df-hlm-3", target.hotel_id),
+                    "timestamp": timestamp_iso,
+                    "confidence_score": 0.55,
+                    "provenance": self._mock_provenance(timestamp_iso),
+                }
+            ]
         stars = float(merged.get("stars", fallback["stars"]))
         return HotelSnapshot(
             snapshot_date=snapshot_date,
@@ -432,13 +494,25 @@ class KonkurrenzTracker:
         writer.writeheader()
         for snapshot in snapshots:
             writer.writerow(snapshot.to_csv_row())
-        atomic_write_text(path, buf.getvalue())
+        atomic_write_text(path, self.pii_scrubber.scrub(buf.getvalue()))
         return path
 
     def _write_slack_json(self, snapshot_date: str, mode: TrackerMode, alerts: list[dict[str, Any]]) -> Path:
         path = self.slack_dir / f"{snapshot_date}-alerts.json"
-        payload = {"snapshot_date": snapshot_date, "mode": mode.value, "generated_at_iso": self.now_fn().isoformat(), "alerts": alerts}
-        atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        generated_at_iso = self.now_fn().isoformat()
+        payload = {
+            "snapshot_date": snapshot_date,
+            "mode": mode.value,
+            "generated_at_iso": generated_at_iso,
+            "alerts": alerts,
+            "provenance": make_provenance_envelope(
+                df_id="DF-HLM-3",
+                timestamp_iso=generated_at_iso,
+                is_mock=mode == TrackerMode.CACHE_ONLY,
+            ),
+        }
+        payload_scrubbed = self.pii_scrubber.scrub_dict_recursive(payload)
+        atomic_write_text(path, self.pii_scrubber.scrub(json.dumps(payload_scrubbed, indent=2, ensure_ascii=False) + "\n"))
         return path
 
     def _write_heatmap(self, snapshots: list[HotelSnapshot], snapshot_date: str) -> tuple[Path, dict[str, Any]]:
@@ -469,12 +543,14 @@ class KonkurrenzTracker:
             atomic_write_bytes(path, b"PNG")
         return path, {"regions": regions, "shape": [len(rows), 1], "mode": snapshots[0].mode}
 
-    def run(self, snapshot_date: str | None = None) -> dict[str, Any]:
+    def _run_unlocked(self, snapshot_date: str | None = None) -> dict[str, Any]:
         snap_date = snapshot_date or self.now_fn().date().isoformat()
         snapshots: list[HotelSnapshot] = []
         trustpilot_ok = False
         booking_ok = False
         scraped_ok = False
+        if self.real_mode_enabled():
+            self._pre_action_verify_real_mode()
         for target in self.targets:
             tp: dict[str, Any] | None = None
             bk: dict[str, Any] | None = None
@@ -502,12 +578,16 @@ class KonkurrenzTracker:
         alerts = self.build_alerts(snapshots, baseline)
         csv_path = self._write_csv(snapshots, snap_date)
         heatmap_path, heatmap_dict = self._write_heatmap(snapshots, snap_date)
-        slack_path = self._write_slack_json(snap_date, self.current_mode(trustpilot_ok, booking_ok, scraped_ok), alerts)
-        audit = {"event": "tracker_run", "snapshot_date": snap_date, "mode": self.current_mode(trustpilot_ok, booking_ok, scraped_ok).value, "alerts": len(alerts), "count": len(snapshots), "ts": self.now_fn().isoformat()}
-        self.logger.info("tracker_run", **audit)
-        atomic_append_jsonl(self.audit_log_path, audit)
+        mode = self.current_mode(trustpilot_ok, booking_ok, scraped_ok)
+        slack_path = self._write_slack_json(snap_date, mode, alerts)
+        event_name = "mock_run_complete" if mode == TrackerMode.CACHE_ONLY else "run_complete"
+        audit = {"event": event_name, "snapshot_date": snap_date, "mode": mode.value, "alerts": len(alerts), "count": len(snapshots), "ts": self.now_fn().isoformat()}
+        audit_scrubbed = scrub_audit_payload(audit)
+        log_kwargs = {k: v for k, v in audit_scrubbed.items() if k != "event"}
+        self.logger.info(event_name, **log_kwargs)
+        atomic_append_jsonl(self.audit_log_path, audit_scrubbed)
         return {
-            "mode": self.current_mode(trustpilot_ok, booking_ok, scraped_ok).value,
+            "mode": mode.value,
             "csv_path": str(csv_path),
             "heatmap_path": str(heatmap_path),
             "slack_alert_path": str(slack_path),
@@ -515,6 +595,16 @@ class KonkurrenzTracker:
             "heatmap": heatmap_dict,
             "snapshots": snapshots,
         }
+
+    def run(self, snapshot_date: str | None = None) -> dict[str, Any]:
+        if self.skip_mutex_for_tests:
+            return self._run_unlocked(snapshot_date)
+        with K16MutexGuard(
+            lock_dir=self.lock_dir,
+            df_engine_marker="konkurrenz_tracker.py",
+            stale_age_hours=float(self.config["k16_concurrent_spawn_mutex"].get("lock_stale_age_h", 6.0)),
+        ):
+            return self._run_unlocked(snapshot_date)
 
 
 def main() -> int:

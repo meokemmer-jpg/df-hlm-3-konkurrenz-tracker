@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -206,7 +207,7 @@ def test_slack_alert_json_schema(tmp_path, monkeypatch):
     (tracker.daily_dir / "2026-05-13.csv").write_text("snapshot_date,hotel_id,hotel_name,brand,region,is_heylou,stars,position,price_low,price_high,review_count,mode,fetched_at_iso,confidence_score,provenance\n2026-05-13,heylou-hildesheim,HeyLou Hildesheim,HeyLou,Hildesheim,True,4.5,1,80,120,10,full,2026-05-13T04:00:00+00:00,0.9,[]\n", encoding="utf-8")
     result = tracker.run("2026-05-14")
     payload = json.loads(Path(result["slack_alert_path"]).read_text(encoding="utf-8"))
-    assert sorted(payload.keys()) == ["alerts", "generated_at_iso", "mode", "snapshot_date"]
+    assert sorted(payload.keys()) == ["alerts", "generated_at_iso", "mode", "provenance", "snapshot_date"]
 
 
 def test_rate_limit_backoff_60s(tmp_path, monkeypatch):
@@ -242,3 +243,54 @@ def test_audit_log_appended_per_run(tmp_path, monkeypatch):
     tracker.run("2026-05-14")
     tracker.run("2026-05-15")
     assert len(Path(tracker.audit_log_path).read_text(encoding="utf-8").strip().splitlines()) == 2
+
+
+def test_pii_scrubbed_in_output_with_kemmer_name(tmp_path, monkeypatch):
+    """Output enthaelt keinen Kemmer-Familien-Namen."""
+    config = build_config(tmp_path)
+    config["source_catalog"]["hotels"][0]["hotel_name"] = "Martin Hildesheim"
+    module = load_module()
+    now = lambda: datetime(2026, 5, 14, 4, 0, tzinfo=timezone.utc)
+    tracker = module.KonkurrenzTracker(config, output_root=tmp_path, now_fn=now)
+    result = tracker.run("2026-05-14")
+    csv_text = Path(result["csv_path"]).read_text(encoding="utf-8")
+    slack_text = Path(result["slack_alert_path"]).read_text(encoding="utf-8")
+    assert "Martin" not in csv_text
+    assert "Martin" not in slack_text
+
+
+def test_k13_pre_action_verification_env_tag_block(tmp_path, monkeypatch):
+    """Real-Mode mit falschem env_tag wird geblockt."""
+    monkeypatch.setenv("DF_ENV_TAG", "prod")
+    enable_real_mode(monkeypatch)
+    _, tracker = make_tracker(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError) as exc_info:
+        tracker.run("2026-05-14")
+    assert "K13" in str(exc_info.value)
+
+
+def test_mock_provenance_explicit_in_output(tmp_path, monkeypatch):
+    """Mock-Outputs haben 'mode': 'mock' in Provenance."""
+    _, tracker = make_tracker(tmp_path, monkeypatch)
+    result = tracker.run("2026-05-14")
+    csv_text = Path(result["csv_path"]).read_text(encoding="utf-8")
+    slack_payload = json.loads(Path(result["slack_alert_path"]).read_text(encoding="utf-8"))
+    assert '"mode": "mock"' in csv_text.replace('""', '"')
+    assert "MOCK-" in csv_text
+    assert slack_payload["provenance"]["mode"] == "mock"
+
+
+def test_k16_mutex_blocks_concurrent_spawn(tmp_path, monkeypatch):
+    """Concurrent Engine-Spawn wird geblockt."""
+    lock_dir = Path("/tmp/df-hlm-3.lock")
+    shutil.rmtree(lock_dir, ignore_errors=True)
+    _, first = make_tracker(tmp_path, monkeypatch)
+    _, second = make_tracker(tmp_path, monkeypatch)
+    assert first.acquire_mutex() is True
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            second.run("2026-05-14")
+        assert "K16-VETO" in str(exc_info.value)
+    finally:
+        first.release_mutex()
+        shutil.rmtree(lock_dir, ignore_errors=True)
