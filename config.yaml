@@ -1,0 +1,185 @@
+# DF-HLM-3 Konkurrenz-Tracker Configuration [CRUX-MK]
+
+df_id: DF-HLM-3
+df_name: konkurrenz-tracker
+version: 0.1.0-WAVE-2
+status: ACTIVE
+crux-mk: true
+
+description: |
+  Konkurrenz-Tracker fuer HeyLou-Marketing-Wave-2.
+  Aggregiert Trustpilot-Ratings, Booking.com-Partnerdaten und Web-Scraping-Fallback
+  fuer 7 HeyLou-Hotels plus 12 relevante Konkurrenz-Standorte.
+  Output: taegliches CSV, Heatmap-Image und Slack-Alert-JSON.
+
+k11_cascade_containment:
+  cascade_isolation: hard
+  failure_blast_radius: 1
+  dependency_dlq_separate: true
+  dependency_dlq_strategy: "eigene DLQ pro Hotel; Trustpilot/Booking-Failures bleiben auf Hotel-Ebene isoliert"
+
+k12_distillation_resistenz:
+  provenance_required_in_output: true
+  non_llm_validation_layer: "deterministischer rating_diff_check + market_position_diff"
+
+k13_independent_ground_truth:
+  external_anchor_type: external_api_source
+  pre_action_domain_check: true
+  external_anchor_sources:
+    - trustpilot_api
+    - booking_partner_api
+
+k14_human_override_decay:
+  override_complexity: single_command
+  martin_review_cadence: monthly
+
+k15_entropy_budget:
+  entropy_added_loc_estimate: 400
+  entropy_justified_by_rho: "EUR 40-55k/Jahr Konkurrenz-Reaction-Velocity"
+
+k16_concurrent_spawn_mutex:
+  lock_dir: /tmp/df-hlm-3.lock
+  engine_pgrep_check: true
+  lock_stale_age_h: 6
+
+lose_coupling:
+  LC1_graceful_degradation:
+    modes:
+      - full
+      - degraded_trustpilot_api
+      - degraded_booking_api
+      - web_scraping_fallback
+      - standalone_cache_only
+  LC2_direct_mode_fallback:
+    capability: 0.80
+    trigger: ">=1 API unreachable >30s"
+  LC3_circuit_breaker:
+    timeout_s: 30
+    open_threshold: 3
+    rate_limit_backoff_s: 60
+  LC4_failure_isolation:
+    state_externalization: true
+    idempotent: true
+  LC5_health_check_independence:
+    health_check_dependencies: []
+
+env_var_gating:
+  default_mode: mock
+  required_for_real_mode:
+    DF_HLM_3_REAL_TRUSTPILOT_ENABLED: true
+    DF_HLM_3_REAL_BOOKING_PARTNER_ENABLED: true
+    PHRONESIS_TICKET: PT-2026-XX-XXX
+
+operations:
+  output_path: ~/Projects/dark-factories/df-hlm-3-konkurrenz-tracker/
+  accessible_mirror_path: ~/Library/CloudStorage/GoogleDrive-m.e.o.kemmer@gmail.com/Meine Ablage/Claude-Knowledge-System/dark-factories/df-hlm-3-konkurrenz-tracker/
+  daily_output_dir: outputs/daily
+  heatmap_dir: outputs/heatmaps
+  slack_alert_dir: outputs/slack
+  audit_log_path: audit/df-hlm-3-audit.jsonl
+  dlq_dir: runs/dlq
+  health_file_path: /tmp/df-hlm-3-health.json
+  allowed_domains:
+    - api.trustpilot.com
+    - distribution-xml.booking.com
+    - booking.com
+    - www.booking.com
+    - trustpilot.com
+
+source_catalog:
+  hotels:
+    - hotel_id: heylou-hildesheim
+      hotel_name: HeyLou Hildesheim
+      brand: HeyLou
+      region: Hildesheim
+      is_heylou: true
+    - hotel_id: heylou-frankfurt
+      hotel_name: HeyLou Frankfurt
+      brand: HeyLou
+      region: Frankfurt
+      is_heylou: true
+    - hotel_id: heylou-karlsruhe
+      hotel_name: HeyLou Karlsruhe
+      brand: HeyLou
+      region: Karlsruhe
+      is_heylou: true
+    - hotel_id: heylou-hannover
+      hotel_name: HeyLou Hannover
+      brand: HeyLou
+      region: Hildesheim
+      is_heylou: true
+    - hotel_id: heylou-darmstadt
+      hotel_name: HeyLou Darmstadt
+      brand: HeyLou
+      region: Frankfurt
+      is_heylou: true
+    - hotel_id: heylou-pforzheim
+      hotel_name: HeyLou Pforzheim
+      brand: HeyLou
+      region: Karlsruhe
+      is_heylou: true
+    - hotel_id: heylou-mitte
+      hotel_name: HeyLou Mitte
+      brand: HeyLou
+      region: Frankfurt
+      is_heylou: true
+    - hotel_id: motel-one-hildesheim
+      hotel_name: Motel One Hildesheim
+      brand: Motel One
+      region: Hildesheim
+      is_heylou: false
+    - hotel_id: motel-one-frankfurt
+      hotel_name: Motel One Frankfurt
+      brand: Motel One
+      region: Frankfurt
+      is_heylou: false
+    - hotel_id: motel-one-karlsruhe
+      hotel_name: Motel One Karlsruhe
+      brand: Motel One
+      region: Karlsruhe
+      is_heylou: false
+    - hotel_id: premier-inn-hildesheim
+      hotel_name: Premier Inn Hildesheim
+      brand: Premier Inn
+      region: Hildesheim
+      is_heylou: false
+    - hotel_id: premier-inn-frankfurt
+      hotel_name: Premier Inn Frankfurt
+      brand: Premier Inn
+      region: Frankfurt
+      is_heylou: false
+    - hotel_id: premier-inn-karlsruhe
+      hotel_name: Premier Inn Karlsruhe
+      brand: Premier Inn
+      region: Karlsruhe
+      is_heylou: false
+    - hotel_id: bb-hildesheim
+      hotel_name: B&B Hotel Hildesheim
+      brand: B&B Hotels
+      region: Hildesheim
+      is_heylou: false
+    - hotel_id: bb-frankfurt
+      hotel_name: B&B Hotel Frankfurt
+      brand: B&B Hotels
+      region: Frankfurt
+      is_heylou: false
+    - hotel_id: bb-karlsruhe
+      hotel_name: B&B Hotel Karlsruhe
+      brand: B&B Hotels
+      region: Karlsruhe
+      is_heylou: false
+    - hotel_id: hotel-zur-krone-hildesheim
+      hotel_name: Hotel zur Krone Hildesheim
+      brand: Lokal
+      region: Hildesheim
+      is_heylou: false
+    - hotel_id: hotel-kulm-frankfurt
+      hotel_name: Hotel Kulm Frankfurt
+      brand: Lokal
+      region: Frankfurt
+      is_heylou: false
+    - hotel_id: hotel-karlsruher-hof
+      hotel_name: Hotel Karlsruher Hof
+      brand: Lokal
+      region: Karlsruhe
+      is_heylou: false
