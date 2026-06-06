@@ -1,0 +1,8 @@
+{
+  "df": "df-hlm-3-konkurrenz-tracker",
+  "ts": "2026-06-05T14:11:06.393225+00:00",
+  "ok": true,
+  "bytes": 3292,
+  "model": "qwen2.5:14b-instruct",
+  "duration_s": 92.1
+}
