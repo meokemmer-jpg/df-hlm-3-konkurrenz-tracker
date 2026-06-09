@@ -1,0 +1,12 @@
+{
+  "df": "df-hlm-3-konkurrenz-tracker",
+  "ts": "2026-06-08T19:54:58.995293+00:00",
+  "has_src": true,
+  "parse_ok": true,
+  "has_tests": true,
+  "test_ran": true,
+  "tests_passed": true,
+  "code_hash": "a5ad9390cefd91e8",
+  "python": "3.14.4",
+  "crux": "[CRUX-MK]"
+}
