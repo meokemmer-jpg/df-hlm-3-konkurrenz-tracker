@@ -1,9 +1,9 @@
 {
   "df": "df-hlm-3-konkurrenz-tracker",
-  "ts": "2026-07-18T15:56:07.128368+00:00",
+  "ts": "2026-07-19T15:56:51.368878+00:00",
   "maturity": "TESTED",
   "maturity_level": 4,
   "evidence_grade": 4,
-  "wargame_verdict": "CONDITIONAL",
+  "wargame_verdict": null,
   "crux": "[CRUX-MK]"
 }
